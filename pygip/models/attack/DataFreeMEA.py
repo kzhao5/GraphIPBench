@@ -65,12 +65,19 @@ class DFEAAttack(BaseAttack):
         self.feature_number = dataset.num_features
         self.label_number = dataset.num_classes
 
-        # Use the maximum of the two visibility ratios as the budget; 
+        # Use the maximum of the two visibility ratios as the budget;
         # if both are 0, fallback to a small default value to avoid zero-size graph
         ratio_budget = max(float(attack_x_ratio), float(attack_a_ratio))
         if ratio_budget <= 0.0:
             ratio_budget = 0.05
         self.attack_node_number = max(1, int(dataset.num_nodes * ratio_budget))
+        # Cap synthetic graph size for very large host graphs (OGBNArxiv 169K nodes).
+        # nx.erdos_renyi_graph(N, p=0.05) at N=169K → ~1.4B edges → OOM on any GPU.
+        SYNTH_CAP = 30000
+        if self.attack_node_number > SYNTH_CAP:
+            print(f"[DFEA] capping synthetic graph from {self.attack_node_number} to {SYNTH_CAP} nodes "
+                  f"(host graph has {dataset.num_nodes} nodes; full size would OOM)")
+            self.attack_node_number = SYNTH_CAP
 
         # Generate synthetic graph and features for surrogate training (data-free)
         # Pass the real features as a reference so synthetic features better match
@@ -130,9 +137,14 @@ class DFEAAttack(BaseAttack):
 
     def _load_model(self, model_path):
         # Load a pretrained victim model
-        model = GCN(self.feature_number, self.label_number)
-        state = torch.load(model_path, map_location=self.device)
-        model.load_state_dict(state)
+        from pygip.models.nn.backbones import create_model as _create
+        state_dict, arch = self._load_state_dict(model_path, self.device)
+        if arch and arch != 'gcn':
+            model = _create(arch, self.feature_number, self.label_number)
+        else:
+            model = GCN(self.feature_number, self.label_number)
+        model.load_state_dict(state_dict)
+        model = model.to(self.device)
         model.eval()
         self.model = model
 
@@ -215,6 +227,7 @@ class DFEATypeI(DFEAAttack):
         train_surrogate_end = time.time()
 
         surrogate.eval()
+        self.surrogate = surrogate  # Store for external access
         self._evaluate_on_real_test(surrogate, metric, metric_comp)
 
         metric_comp.end()
@@ -266,6 +279,7 @@ class DFEATypeII(DFEAAttack):
         train_surrogate_end = time.time()
 
         surrogate.eval()
+        self.surrogate = surrogate  # Store for external access
         self._evaluate_on_real_test(surrogate, metric, metric_comp)
 
         metric_comp.end()
@@ -326,6 +340,7 @@ class DFEATypeIII(DFEAAttack):
 
         # Use s1 as the final surrogate for evaluation
         s1.eval()
+        self.surrogate = s1  # Store for external access
         self._evaluate_on_real_test(s1, metric, metric_comp)
 
         metric_comp.end()

@@ -38,13 +38,13 @@ class AdvMEA(BaseAttack):
         """
         Load a pre-trained model.
         """
-        # Create the model
-        self.net1 = GCN(self.num_features, self.num_classes).to(self.device)
-
-        # Load the saved state dict
-        self.net1.load_state_dict(torch.load(model_path, map_location=self.device))
-
-        # Set to evaluation mode
+        from pygip.models.nn.backbones import create_model as _create
+        state_dict, arch = self._load_state_dict(model_path, self.device)
+        if arch and arch != 'gcn':
+            self.net1 = _create(arch, self.num_features, self.num_classes).to(self.device)
+        else:
+            self.net1 = GCN(self.num_features, self.num_classes).to(self.device)
+        self.net1.load_state_dict(state_dict)
         self.net1.eval()
 
     def _train_target_model(self):
@@ -108,19 +108,35 @@ class AdvMEA(BaseAttack):
         edge_index = torch.tensor(edge_index, dtype=torch.long)
 
         attack_s1 = time.time()
-        # Select a center node with certain size
-        while True:
+        # Select a center node with certain size.
+        # On sparse heterophilic graphs (e.g., RomanEmpire) most 2-hop subgraphs are < 45 nodes,
+        # so we widen the bracket and fall back to the closest match within a budget of attempts.
+        target_lo, target_hi = 45, 50
+        max_attempts = 2000
+        best_choice = None  # (sub_node_index, sub_edge_index, distance_from_target)
+        for attempt in range(max_attempts):
             node_index = torch.randint(0, self.num_nodes, (1,)).item()
-            # print("node_index=",node_index)
-            sub_node_index, sub_edge_index, _, _ = k_hop_subgraph(node_index, 2, edge_index, relabel_nodes=True,
-                                                                  num_nodes=self.num_nodes)
-            if 45 <= sub_node_index.size(0) <= 50:
-                As = torch.zeros((sub_node_index.size(0), sub_node_index.size(0)))
-                As[sub_edge_index[0], sub_edge_index[1]] = 1
-                print("sub_node_index=", sub_node_index.size(0))
-                # Ensure moved to CPU
-                Xs = self._to_cpu(self.features[sub_node_index])
+            sub_node_index, sub_edge_index, _, _ = k_hop_subgraph(
+                node_index, 2, edge_index, relabel_nodes=True, num_nodes=self.num_nodes)
+            sz = sub_node_index.size(0)
+            if target_lo <= sz <= target_hi:
+                best_choice = (sub_node_index, sub_edge_index, 0)
                 break
+            # Track the candidate with size nearest to the [45,50] window
+            if sz >= 5:  # ignore degenerate single-node subgraphs
+                dist = max(target_lo - sz, sz - target_hi, 0)
+                if best_choice is None or dist < best_choice[2]:
+                    best_choice = (sub_node_index, sub_edge_index, dist)
+        if best_choice is None:
+            raise RuntimeError(
+                f"AdvMEA: could not find a subgraph with >= 5 nodes after {max_attempts} attempts; "
+                f"graph too sparse (num_nodes={self.num_nodes}).")
+        sub_node_index, sub_edge_index, _ = best_choice
+        As = torch.zeros((sub_node_index.size(0), sub_node_index.size(0)))
+        As[sub_edge_index[0], sub_edge_index[1]] = 1
+        print(f"sub_node_index={sub_node_index.size(0)} (target [{target_lo},{target_hi}])")
+        # Ensure moved to CPU
+        Xs = self._to_cpu(self.features[sub_node_index])
 
         # Construct the prior distribution
         Fd = []
@@ -132,12 +148,25 @@ class AdvMEA(BaseAttack):
             class_nodes = features_cpu[labels_cpu == label].numpy()
 
             feature_counts = class_nodes.sum(axis=0)
-            feature_distribution = feature_counts / feature_counts.sum()
+            # Clamp to non-negative for probability distribution (some datasets have
+            # normalized features with negative values, e.g. AmazonRatings/OGBNArxiv)
+            feature_counts = np.clip(feature_counts, 0, None)
+            total_fc = feature_counts.sum()
+            if total_fc > 0:
+                feature_distribution = feature_counts / total_fc
+            else:
+                feature_distribution = np.ones_like(feature_counts) / len(feature_counts)
             Fd.append(feature_distribution)
 
             num_features_per_node = class_nodes.sum(axis=1)
-            feature_count_distribution = np.bincount(num_features_per_node.astype(int), minlength=self.num_features)
-            Md.append(feature_count_distribution / feature_count_distribution.sum())
+            # Clamp negative values to 0 for bincount (can happen with some feature spaces)
+            num_features_clamped = np.clip(num_features_per_node, 0, None).astype(int)
+            feature_count_distribution = np.bincount(num_features_clamped, minlength=self.num_features)
+            total = feature_count_distribution.sum()
+            if total > 0:
+                Md.append(feature_count_distribution / total)
+            else:
+                Md.append(np.ones(len(feature_count_distribution)) / len(feature_count_distribution))
 
         SA = [As]
         SX = [Xs]
@@ -164,7 +193,10 @@ class AdvMEA(BaseAttack):
             _, initial_label = torch.max(initial_query, dim=1)
 
         SL = self._to_cpu(initial_label).tolist()
-        samples_per_class = 10
+        # Budget-aware: samples_per_class scales with attack_node_fraction
+        # Base is 10 samples/class at budget=1.0; at budget=0.05, use 1 sample; at 0.5, 5 samples
+        budget = float(self.attack_node_fraction) if self.attack_node_fraction else 1.0
+        samples_per_class = max(1, int(round(10 * budget)))
         n = samples_per_class
 
         for i in range(n):
@@ -242,6 +274,8 @@ class AdvMEA(BaseAttack):
             metric_comp.update(inference_surrogate_time=(time.time() - t0))
 
         train_surrogate_e = time.time()
+
+        self.surrogate = net6  # Store for external access (e.g., watermark survival eval)
 
         print("========================Final results:=========================================")
         metric_comp.end()

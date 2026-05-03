@@ -35,3 +35,41 @@ datasets/
 .DS_Store
 .vscode/
 .idea/
+
+# Paper artefacts (do NOT push to anonymous code repo)
+*.tex
+*.pdf
+*.bbl
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
+checklist.tex
+figs/
+Paper Figures/
+*Tables.md
+*Revision_Plan.md
+
+# Test logs and ad-hoc result dumps (the real results live in outputs/, already ignored)
+*_output.txt
+*_results.txt
+test_*.txt
+results_*.txt
+cross_arch_*.txt
+endpoint_ablation*.txt
+linkprediction_output.txt
+
+# Backup files
+*.backup
+*.bak
+*~
+
+# Cluster-specific Slurm submission and migration scripts (non-portable, contain absolute paths).
+# Reproduction does not need them; users on other clusters should write their own submission wrapper.
+scripts/submit_*.sh
+scripts/migrate_*.sh
+
+# One-off local helper that patches the installed package; not needed for reproduction.
+pygip/fix_backbones.py
+pygip/download_cora.py

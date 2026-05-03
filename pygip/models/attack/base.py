@@ -97,6 +97,21 @@ class BaseAttack(ABC):
         """
         raise NotImplementedError
 
+    @staticmethod
+    def _load_state_dict(model_path, device):
+        """Load a state dict from a checkpoint file.
+
+        Handles both raw state_dict files and the extended format
+        {'arch': ..., 'state_dict': ...} used by joint evaluation.
+
+        Returns:
+            (state_dict, arch_name) where arch_name is None for raw files.
+        """
+        state = torch.load(model_path, map_location=device)
+        if isinstance(state, dict) and 'state_dict' in state:
+            return state['state_dict'], state.get('arch', None)
+        return state, None
+
     def _train_target_model(self):
         """
         Train the target model if not provided.

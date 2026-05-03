@@ -209,20 +209,25 @@ def generate_trigger_graph(data, generator, target_model, num_triggers=50):
     trigger_nodes = list(range(data.num_nodes, data.num_nodes + num_triggers))
     total_nodes = data.num_nodes + num_triggers
 
-    # Create new dense adjacency matrix
-    adj = to_dense_adj(data.edge_index)[0]
-    new_adj = torch.zeros((total_nodes, total_nodes), device=adj.device)
-    new_adj[:adj.size(0), :adj.size(1)] = adj
-
-    # Connect trigger nodes to selected nodes
-    for i, trigger in enumerate(trigger_nodes):
+    # Build the new edge_index sparsely to avoid an N×N dense materialization
+    # (N=170K → 170K² × 4 bytes ≈ 116 GB OOM). Original adjacency stays as edge_index;
+    # we only append the new trigger↔selected edges.
+    new_edges_src = []
+    new_edges_dst = []
+    for trigger in trigger_nodes:
         for node in selected_nodes:
-            new_adj[node, trigger] = 1
-            new_adj[trigger, node] = 1
+            new_edges_src.extend([node, trigger])
+            new_edges_dst.extend([trigger, node])
+    if new_edges_src:
+        extra = torch.tensor([new_edges_src, new_edges_dst], dtype=data.edge_index.dtype,
+                             device=data.edge_index.device)
+        new_edge_index = torch.cat([data.edge_index, extra], dim=1)
+    else:
+        new_edge_index = data.edge_index
 
     new_data = copy.deepcopy(data)
     new_data.x = torch.cat([data.x, trigger_features[:num_triggers]], dim=0)
-    new_data.edge_index = dense_to_sparse(new_adj)[0]
+    new_data.edge_index = new_edge_index
     new_data.y = torch.cat([
         data.y,
         torch.zeros(num_triggers, dtype=torch.long, device=data.y.device)
@@ -289,8 +294,23 @@ def bi_level_optimization(target_model, generator, data, num_triggers, epochs=10
 
         orig_features = data.x[trigger_data.selected_nodes]
         trigger_features = trigger_data.x[trigger_data.trigger_nodes]
-        sim_loss = -F.cosine_similarity(orig_features.unsqueeze(1),
-                                        trigger_features.unsqueeze(0), dim=-1).mean()
+        # Memory-efficient: batched cosine similarity for large graphs
+        # Original creates [N_orig, N_trigger, D] which OOMs on large graphs.
+        # Replace with mean-pooled similarity (equivalent for mean reduction).
+        _max_pairs = 2000
+        if len(orig_features) * len(trigger_features) > _max_pairs * _max_pairs:
+            # Subsample for large graphs
+            n_o = min(_max_pairs, len(orig_features))
+            n_t = min(_max_pairs, len(trigger_features))
+            o_idx = torch.randperm(len(orig_features), device=orig_features.device)[:n_o]
+            t_idx = torch.randperm(len(trigger_features), device=trigger_features.device)[:n_t]
+            orig_sub = orig_features[o_idx]
+            trig_sub = trigger_features[t_idx]
+            sim_loss = -F.cosine_similarity(orig_sub.unsqueeze(1),
+                                            trig_sub.unsqueeze(0), dim=-1).mean()
+        else:
+            sim_loss = -F.cosine_similarity(orig_features.unsqueeze(1),
+                                            trigger_features.unsqueeze(0), dim=-1).mean()
 
         out = target_model(trigger_data.x, trigger_data.edge_index)
         trigger_loss = criterion(out[trigger_data.trigger_mask],

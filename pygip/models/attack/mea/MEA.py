@@ -202,9 +202,13 @@ class _MEABase(BaseAttack):
             pass
 
     def _load_model(self, model_path: str):
-        self.net1 = GCN(self.num_features, self.num_classes).to(self.device)
-        state = torch.load(model_path, map_location=self.device)
-        self.net1.load_state_dict(state)
+        from pygip.models.nn.backbones import create_model as _create
+        state_dict, arch = self._load_state_dict(model_path, self.device)
+        if arch and arch != 'gcn':
+            self.net1 = _create(arch, self.num_features, self.num_classes).to(self.device)
+        else:
+            self.net1 = GCN(self.num_features, self.num_classes).to(self.device)
+        self.net1.load_state_dict(state_dict)
         self.net1.eval()
         # loading a pre-trained model means we didn't train here
         self._preinit_train_time = 0.0
@@ -254,6 +258,7 @@ class _MEABase(BaseAttack):
 
 
     def _compute_metrics(self, surrogate: nn.Module, metric: AttackMetric, metric_comp: AttackCompMetric):
+        self.surrogate = surrogate  # Store for external access (e.g., watermark survival eval)
         g = self.graph                                # 已在 __init__ 中 to(self.device)
         x = self.features.to(self.device)
         y = self.labels.to(self.device)
@@ -377,6 +382,12 @@ class ModelExtractionAttack2(_MEABase):
         # 1) Build synthetic graph G_syn
         # ---------------------------
         num_nodes_syn = max(1, int(max(self.attack_node_num, self.attack_node_num * 2)))
+        # Cap synthetic graph size to avoid OOM on huge host graphs (e.g. OGBNArxiv 169K).
+        # nx.expected_degree_graph() on > 50K nodes will OOM at high p.
+        SYNTH_CAP = 30000
+        if num_nodes_syn > SYNTH_CAP:
+            print(f"[MEA2] capping synthetic graph from {num_nodes_syn} to {SYNTH_CAP} nodes")
+            num_nodes_syn = SYNTH_CAP
         try:
             orig_deg = self.graph.in_degrees().cpu().numpy()
             if orig_deg.size == 0:

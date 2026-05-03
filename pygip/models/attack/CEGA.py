@@ -543,8 +543,13 @@ class CEGA(BaseAttack):
 
     def _load_model(self, model_path):
         """Load a pre-trained target model state dict."""
-        self.net1 = GCN(self.num_features, self.num_classes).to(self.device)
-        self.net1.load_state_dict(torch.load(model_path, map_location=self.device))
+        from pygip.models.nn.backbones import create_model as _create
+        state_dict, arch = self._load_state_dict(model_path, self.device)
+        if arch and arch != 'gcn':
+            self.net1 = _create(arch, self.num_features, self.num_classes).to(self.device)
+        else:
+            self.net1 = GCN(self.num_features, self.num_classes).to(self.device)
+        self.net1.load_state_dict(state_dict)
         self.net1.eval()
 
     def _forward(self, model, graph, features):
@@ -763,6 +768,8 @@ class CEGA(BaseAttack):
                 preds_test = preds_s[test_mask]
                 labels_test = self.labels[test_mask]
                 query_test = preds_target[test_mask]
+
+            self.surrogate = surrogate  # Store for external access
 
             metric.update(preds_test, labels_test, query_test)
             metric_comp.update(

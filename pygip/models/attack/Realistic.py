@@ -115,7 +115,17 @@ class RealisticAttack(BaseAttack):
         ).to(self.device)
 
         # Target model used to simulate black-box responses.
-        self.net1 = GCN(self.num_features, self.num_classes).to(self.device)
+        if model_path is not None:
+            from pygip.models.nn.backbones import create_model as _create
+            state_dict, arch = self._load_state_dict(model_path, self.device)
+            if arch and arch != 'gcn':
+                self.net1 = _create(arch, self.num_features, self.num_classes).to(self.device)
+            else:
+                self.net1 = GCN(self.num_features, self.num_classes).to(self.device)
+            self.net1.load_state_dict(state_dict)
+            self.net1.eval()
+        else:
+            self.net1 = GCN(self.num_features, self.num_classes).to(self.device)
 
         # Optimizers
         self.optimizer_edge = optim.Adam(self.edge_predictor.parameters(), lr=0.01, weight_decay=5e-4)
@@ -176,20 +186,53 @@ class RealisticAttack(BaseAttack):
         return predicted_labels
 
     def compute_cosine_similarity(self, features):
-        """Compute cosine similarity of node features."""
+        """Compute cosine similarity of node features. Materializes an N×N matrix."""
         features_np = features.cpu().detach().numpy()
         similarity_matrix = cosine_similarity(features_np)
         return torch.tensor(similarity_matrix, dtype=torch.float32, device=self.device)
 
     def generate_candidate_edges(self, labeled_nodes, unlabeled_nodes):
-        """Generate candidate edges based on feature cosine similarity threshold."""
-        similarity_matrix = self.compute_cosine_similarity(self.features)
-        candidate_edges = []
-        for u_node in unlabeled_nodes:
-            for l_node in labeled_nodes:
-                if similarity_matrix[u_node, l_node] > self.threshold_s:
-                    candidate_edges.append([u_node, l_node])
-        print(f"Generated {len(candidate_edges)} candidate edges based on cosine similarity")
+        """Generate candidate edges based on feature cosine similarity threshold.
+
+        For very large graphs (>30K nodes) the dense N×N cosine matrix would OOM,
+        so we compute similarity on the fly only between (unlabeled, labeled) pairs.
+        """
+        n_lab = len(labeled_nodes)
+        n_unlab = len(unlabeled_nodes)
+        large_graph = self.num_nodes > 30000
+
+        if not large_graph:
+            similarity_matrix = self.compute_cosine_similarity(self.features)
+            candidate_edges = []
+            for u_node in unlabeled_nodes:
+                for l_node in labeled_nodes:
+                    if similarity_matrix[u_node, l_node] > self.threshold_s:
+                        candidate_edges.append([u_node, l_node])
+            print(f"Generated {len(candidate_edges)} candidate edges based on cosine similarity")
+            return candidate_edges
+
+        # Large-graph path: subsample to keep memory bounded.
+        # Cap both sides so the final pairwise op fits in memory: keep <= 5000 each.
+        if n_lab == 0 or n_unlab == 0:
+            print("Generated 0 candidate edges (empty labeled or unlabeled set)")
+            return []
+        import random as _rnd
+        sample_lab = labeled_nodes if n_lab <= 5000 else _rnd.sample(labeled_nodes, 5000)
+        sample_unlab = unlabeled_nodes if n_unlab <= 5000 else _rnd.sample(unlabeled_nodes, 5000)
+        feats = self.features
+        with torch.no_grad():
+            f_lab = feats[torch.tensor(sample_lab, dtype=torch.long, device=feats.device)]
+            f_unlab = feats[torch.tensor(sample_unlab, dtype=torch.long, device=feats.device)]
+            f_lab_n = torch.nn.functional.normalize(f_lab, dim=1)
+            f_unlab_n = torch.nn.functional.normalize(f_unlab, dim=1)
+            sim = f_unlab_n @ f_lab_n.T  # (|sample_unlab|, |sample_lab|)
+            mask = sim > self.threshold_s
+        # Recover original indices and build candidate list.
+        idx_u, idx_l = mask.nonzero(as_tuple=True)
+        candidate_edges = [[sample_unlab[i.item()], sample_lab[j.item()]]
+                           for i, j in zip(idx_u, idx_l)]
+        print(f"Generated {len(candidate_edges)} candidate edges (large-graph subsampled, "
+              f"|U|={len(sample_unlab)}, |L|={len(sample_lab)})")
         return candidate_edges
 
     def train_edge_predictor(self, labeled_nodes, predicted_labels, epochs=100):
@@ -247,6 +290,13 @@ class RealisticAttack(BaseAttack):
         """Add potential edges whose predicted probability exceeds the threshold."""
         if not candidate_edges:
             return self.graph
+
+        # Cap candidate count for huge graphs (predict_edges allocates O(C×D) tensors).
+        EDGE_CAP = 200000
+        if len(candidate_edges) > EDGE_CAP:
+            import random as _rnd
+            print(f"  Capping candidate edges from {len(candidate_edges)} to {EDGE_CAP} for memory")
+            candidate_edges = _rnd.sample(candidate_edges, EDGE_CAP)
 
         print("Predicting edge weights and adding potential edges...")
         self.edge_predictor.eval()
@@ -363,6 +413,7 @@ class RealisticAttack(BaseAttack):
 
         # Step 7: One-shot evaluation and metrics update.
         self._evaluate_and_update_metrics(enhanced_graph, metric, metric_comp)
+        self.surrogate = self.surrogate_model  # Store for external access
 
         # Finalize computation stats.
         metric_comp.end()

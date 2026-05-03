@@ -63,6 +63,13 @@ class SurviveWM(BaseDefense):
 
     # === Soft Nearest Neighbor Loss ===
     def snn_loss(self, x, y, T=0.5):
+        # Subsample if x is too large to fit an N×N distance matrix.
+        # 5000² × 4 bytes ≈ 100 MB; 90000² ≈ 32 GB → OOM on big train sets (e.g. OGBNArxiv).
+        SNN_CAP = 5000
+        if x.size(0) > SNN_CAP:
+            perm = torch.randperm(x.size(0), device=x.device)[:SNN_CAP]
+            x = x[perm]
+            y = y[perm]
         x = F.normalize(x, p=2, dim=1)
         dist_matrix = torch.cdist(x, x, p=2) ** 2
         eye = torch.eye(len(x), device=self.device).bool()
